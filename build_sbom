@@ -1,0 +1,71 @@
+#!/usr/bin/python3
+# 필요한 BCC 라이브러리를 불러옵니다.
+from bcc import BPF
+import ctypes as ct
+
+# C 코드를 파이썬 스크립트 안에 문자열로 포함시킵니다.
+# 이 부분이 커널 내부에서 실행될 '팅커벨'의 마법 코드입니다.
+bpf_program_code = """
+#include <uapi/linux/ptrace.h>
+#include <linux/sched.h>
+#include <linux/fs.h>
+
+// 커널에서 사용자 공간으로 데이터를 전달하기 위한 통로(BPF_PERF_OUTPUT)를 만듭니다.
+BPF_PERF_OUTPUT(events);
+
+// execve 시스템 콜이 호출될 때마다 이 함수가 실행됩니다!
+int trace_execve(struct pt_regs *ctx, const char __user *filename) {
+    
+    // 현재 실행된 프로세스의 정보를 담을 구조체를 만듭니다.
+    struct {
+        u32 pid;
+        char comm[TASK_COMM_LEN];
+        char filename[128];
+    } data = {};
+
+    // 현재 프로세스의 ID와 이름을 가져옵니다.
+    data.pid = bpf_get_current_pid_tgid() >> 32;
+    bpf_get_current_comm(&data.comm, sizeof(data.comm));
+    
+    // 실행된 프로그램의 전체 경로를 복사합니다.
+    bpf_probe_read_user_str(&data.filename, sizeof(data.filename), filename);
+
+    // 수집한 데이터를 'events' 통로를 통해 사용자 공간으로 슝 보냅니다.
+    events.perf_submit(ctx, &data, sizeof(data));
+
+    return 0;
+}
+"""
+
+# 1. C로 작성된 eBPF 프로그램을 커널에 로드합니다.
+b = BPF(text=bpf_program_code)
+
+# 2. 'execve' 라는 시스템 콜이 호출될 때, 우리가 C로 작성한 'trace_execve' 함수를
+#    실행하도록 연결(Hook)합니다. 이것이 바로 '트리거' 설정입니다.
+syscall_fnname = b.get_syscall_fnname("execve")
+b.attach_kprobe(event=syscall_fnname, fn_name="trace_execve")
+
+# 3. 화면에 어떤 프로그램이 실행되고 있는지 제목을 출력합니다.
+print("eBPF가 시스템을 감시합니다... 새로운 프로그램이 실행되면 아래에 표시됩니다. (Ctrl+C로 종료)")
+print("%-20s %-10s %-s" % ("PROCESS_NAME", "PID", "EXECUTED_FILE"))
+
+# 4. 커널에서 보내주는 데이터를 받아서 처리할 함수를 정의합니다.
+def print_event(cpu, data, size):
+    # 커널이 보낸 이벤트 데이터를 받아옵니다.
+    event = b["events"].event(data)
+    
+    # 예쁘게 정리해서 화면에 출력합니다.
+    print("%-20s %-10d %-s" % (event.comm.decode('utf-8', 'replace'), event.pid, event.filename.decode('utf-8', 'replace')))
+
+
+# 5. 커널의 'events' 통로와 위에서 만든 print_event 함수를 연결합니다.
+#    이제 커널에서 데이터가 날아올 때마다 print_event 함수가 자동으로 실행됩니다.
+b.open_perf_buffer(print_event)
+
+# 6. 프로그램이 꺼지지 않고 계속해서 커널로부터 데이터를 받을 수 있도록 무한 반복합니다.
+#    (Ctrl+C를 누르면 종료됩니다.)
+while 1:
+    try:
+        b.perf_buffer_poll()
+    except KeyboardInterrupt:
+        exit()
