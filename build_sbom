@@ -60,7 +60,7 @@ def print_event(cpu, data, size):
 
 # 5. 커널의 'events' 통로와 위에서 만든 print_event 함수를 연결합니다.
 #    이제 커널에서 데이터가 날아올 때마다 print_event 함수가 자동으로 실행됩니다.
-b.open_perf_buffer(print_event)
+b["events"].open_perf_buffer(print_event)
 
 # 6. 프로그램이 꺼지지 않고 계속해서 커널로부터 데이터를 받을 수 있도록 무한 반복합니다.
 #    (Ctrl+C를 누르면 종료됩니다.)
