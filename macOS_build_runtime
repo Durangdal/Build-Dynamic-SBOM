@@ -1,0 +1,573 @@
+#!/usr/bin/python3
+from bcc import BPF
+import ctypes as ct
+import json, os, subprocess, psutil
+from datetime import datetime
+from shutil import which
+import platform
+import sys
+
+# 필요한 경우 파일 디스크립터 정리 및 표준 입출력 리디렉션을 위한 컨텍스트 관리자
+class DaemonizeContext:
+    def __init__(self, pid_file='/tmp/runtime_sbom_monitor.pid', stdout_file='/tmp/runtime_sbom_monitor.log', stderr_file='/tmp/runtime_sbom_monitor.log'):
+        self.pid_file = pid_file
+        self.stdout = open(stdout_file, 'a+')
+        self.stderr = open(stderr_file, 'a+', buffering=1) # 라인 버퍼링 활성화
+
+    def __enter__(self):
+        self.cleanup_pid()
+        self.write_pid()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if os.path.exists(self.pid_file):
+            os.remove(self.pid_file)
+        self.stdout.close()
+        self.stderr.close()
+
+    def cleanup_pid(self):
+        # 기존 PID 파일 정리 (선택적)
+        if os.path.exists(self.pid_file):
+            try:
+                with open(self.pid_file, 'r') as f:
+                    pid = int(f.read().strip())
+                if psutil.pid_exists(pid):
+                    print(f"경고: PID {pid}가 이미 실행 중. 종료.")
+                    sys.exit(1)
+                os.remove(self.pid_file)
+            except:
+                pass
+
+    def write_pid(self):
+        with open(self.pid_file, 'w') as f:
+            f.write(str(os.getpid()))
+
+def daemonize(context_manager):
+    try:
+        pid = os.fork()
+        if pid > 0:
+            # 1차 부모 프로세스 종료
+            sys.exit(0)
+    except OSError as e:
+        sys.stderr.write(f"1차 fork 실패: {e}\n")
+        sys.exit(1)
+
+    # 1. 새 세션 그룹 생성 (터미널에서 완전히 분리)
+    os.setsid()
+
+    try:
+        pid = os.fork()
+        if pid > 0:
+            # 2차 부모 프로세스 종료
+            sys.exit(0)
+    except OSError as e:
+        sys.stderr.write(f"2차 fork 실패: {e}\n")
+        sys.exit(1)
+
+    # 2. 작업 디렉토리를 루트로 변경
+    os.chdir("/")
+    # 3. 파일 권한 마스크 초기화
+    os.umask(0)
+
+    # 4. 표준 입출력 재연결
+    sys.stdin.close()
+    
+    # 컨텍스트 관리자를 사용하여 PID 파일 및 로그 파일 처리
+    with context_manager:
+        os.dup2(context_manager.stdout.fileno(), sys.stdout.fileno())
+        os.dup2(context_manager.stderr.fileno(), sys.stderr.fileno())
+        # 실행할 메인 로직을 호출 (main_loop 함수로 분리)
+        main_loop()
+
+
+# eBPF 코드 (execve 감시)
+bpf_program_code = """
+#include <uapi/linux/ptrace.h>
+#include <linux/sched.h>
+#include <linux/fs.h>
+
+BPF_PERF_OUTPUT(events);
+// (eBPF 코드는 생략하지 않고 그대로 유지)
+int trace_execve(struct pt_regs *ctx, const char __user *filename) {
+    struct {
+        u32 pid;
+        char comm[TASK_COMM_LEN];
+        char filename[128];
+    } data = {};
+
+    data.pid = bpf_get_current_pid_tgid() >> 32;
+    bpf_get_current_comm(&data.comm, sizeof(data.comm));
+    bpf_probe_read_user_str(&data.filename, sizeof(data.filename), filename);
+
+    events.perf_submit(ctx, &data, sizeof(data));
+    return 0;
+}
+"""
+
+# 전역 변수 설정 및 초기화 로직 (main_loop에서 사용)
+RUNTIME_SBOM_FILE = "cycloimport os
+import sys
+import json
+import time
+import subprocess
+import psutil
+from datetime import datetime
+from shutil import which
+import platform
+
+# --- [유닉스 데몬화 로직 추가] ---------------------------------------------
+# macOS (Darwin)은 유닉스 기반이므로 os.fork()를 사용할 수 있습니다.
+
+# 데몬화에 필요한 설정 및 컨텍스트 관리자
+class DaemonizeContext:
+    def __init__(self, pid_file='/var/run/dtrace_sbom_monitor.pid', stdout_file='/var/log/dtrace_sbom_monitor.log', stderr_file='/var/log/dtrace_sbom_monitor.log'):
+        # macOS의 표준 데몬 경로 사용
+        self.pid_file = pid_file
+        # stdout, stderr을 파일로 리디렉션하기 위해 파일 디스크립터 생성
+        self.stdout = open(stdout_file, 'a+')
+        self.stderr = open(stderr_file, 'a+', buffering=1)
+
+    def __enter__(self):
+        # 데몬이 시스템 서비스로 실행될 때는 PID 파일 관리가 중요함
+        self.write_pid()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        # 정상/비정상 종료 시 PID 파일 삭제
+        if os.path.exists(self.pid_file):
+            os.remove(self.pid_file)
+        self.stdout.close()
+        self.stderr.close()
+
+    def write_pid(self):
+        # PID 파일 작성 (sudo 권한 필요)
+        try:
+            with open(self.pid_file, 'w') as f:
+                f.write(str(os.getpid()))
+        except Exception as e:
+            # PID 파일 쓰기 실패 시 에러 출력 (데몬화 전)
+            sys.stderr.write(f"경고: PID 파일 ({self.pid_file}) 쓰기 실패. 권한을 확인하세요: {e}\n")
+
+
+def daemonize(context_manager):
+    """표준 Unix 데몬화 로직"""
+    try:
+        pid = os.fork()
+        if pid > 0:
+            # 1차 부모 프로세스 종료
+            sys.exit(0)
+    except OSError as e:
+        sys.stderr.write(f"1차 fork 실패: {e}\n")
+        sys.exit(1)
+
+    # 1. 새 세션 그룹 생성 (터미널에서 완전히 분리)
+    os.setsid()
+
+    try:
+        pid = os.fork()
+        if pid > 0:
+            # 2차 부모 프로세스 종료
+            sys.exit(0)
+    except OSError as e:
+        sys.stderr.write(f"2차 fork 실패: {e}\n")
+        sys.exit(1)
+
+    # 2. 작업 디렉토리를 루트로 변경
+    os.chdir("/")
+    # 3. 파일 권한 마스크 초기화
+    os.umask(0)
+
+    # 4. 표준 입출력 재연결
+    sys.stdin.close()
+    
+    # 컨텍스트 관리자를 사용하여 PID 파일 및 로그 파일 처리
+    with context_manager:
+        # 파일 디스크립터 재연결
+        os.dup2(context_manager.stdout.fileno(), sys.stdout.fileno())
+        os.dup2(context_manager.stderr.fileno(), sys.stderr.fileno())
+        
+        # 메인 로직 호출
+        monitor_dtrace() # DTrace 모니터링 시작
+
+
+# macOS 전용 DTrace 프로브 스크립트
+DTRACE_PROBE_SCRIPT = """
+syscall::execve:entry
+/pid != $target/ {
+    printf("EXEC:%d:%s\\n", pid, copyinstr(arg0));
+}
+"""
+
+# print("🚀 런타임 SBOM 감시 시작 (macOS DTrace 사용 - sudo 권한 필요)\n")
+
+RUNTIME_SBOM_FILE = "cyclonedx-runtime-sbom.json"
+# (SBOM 초기화 및 seen 셋 로직은 그대로 유지)
+
+# --- [유틸리티: 파일 버전 추출] ---------------------------------------------
+def get_soname_unix(filepath: str) -> str:
+    # ... (기존 get_soname_unix 함수 내용 유지) ...
+    try:
+        if not os.path.exists(filepath):
+            return "runtime"
+        
+        # 1. readelf (만약 설치되어 있다면)
+        proc = subprocess.run(["readelf", "-d", filepath], capture_output=True, text=True, timeout=1)
+        if proc.stdout:
+            for line in proc.stdout.splitlines():
+                if "SONAME" in line and "[" in line and "]" in line:
+                    return line.split("[", 1)[1].split("]", 1)[0].strip()
+        
+        # 2. otool -L (macOS 기본 도구)를 통해 라이브러리 식별자를 사용
+        proc = subprocess.run(["otool", "-L", filepath], capture_output=True, text=True, timeout=1)
+        if proc.stdout:
+            lines = proc.stdout.splitlines()
+            if len(lines) > 1 and "dyld" not in lines[1]:
+                path_part = lines[1].strip().split(' ', 1)[0]
+                return os.path.basename(path_part)
+            
+    except Exception:
+        pass
+    return "runtime"
+
+# --- [SBOM 구조 및 초기화] ------------------------------------------------
+def new_sbom():
+    # ... (기존 new_sbom 함수 내용 유지) ...
+    return {
+        "bomFormat": "CycloneDX",
+        "specVersion": "1.5",
+        "version": 1,
+        "metadata": {
+            "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "tools": [
+                {
+                    "vendor": "custom",
+                    "name": "runtime-monitor-dtrace",
+                    "version": "1.0"
+                }
+            ],
+            "component": {
+                "type": "application",
+                "name": "runtime-monitor-dtrace",
+                "version": "1.0"
+            },
+            "properties": [
+                {"name": "host.os", "value": platform.system()},
+                {"name": "host.os_version", "value": platform.version()},
+                {"name": "host.kernel", "value": platform.release()},
+                {"name": "host.arch", "value": platform.machine()}
+            ]
+        },
+        "components": []
+    }
+
+# 기존 파일 로드 또는 새 SBOM 생성
+if os.path.exists(RUNTIME_SBOM_FILE):
+    try:
+        with open(RUNTIME_SBOM_FILE, "r", encoding="utf-8") as f:
+            runtime_sbom = json.load(f)
+    except:
+        runtime_sbom = new_sbom()
+else:
+    runtime_sbom = new_sbom()
+
+seen = set(comp["purl"] for comp in runtime_sbom.get("components", []))
+
+# --- [라이브러리 수집 및 Syft 실행] -----------------------------------------
+def get_loaded_libs(pid: int) -> dict:
+    # ... (기존 get_loaded_libs 함수 내용 유지) ...
+    libs_info = {}
+    try:
+        proc = psutil.Process(pid)
+        for m in proc.memory_maps():
+            path = getattr(m, "path", None)
+            if not path or not os.path.isabs(path) or not os.path.isfile(path):
+                continue
+            if path in libs_info:
+                continue
+            
+            # macOS 버전 추출 함수 사용
+            version = get_soname_unix(path)
+            libs_info[path] = version
+    except Exception:
+        pass
+    return libs_info
+
+def run_syft(exe_file: str, pid: int):
+    # ... (기존 run_syft 함수 내용 유지) ...
+    if not which("syft"):
+        # 데몬 환경에서는 print 대신 로깅 라이브러리를 사용해야 하지만, 여기서는 임시로 print 사용
+        print(f"[!] syft 미설치: 정적 SBOM 생략")
+        return
+    timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    out_file = f"cyclonedx-static-sbom_{os.path.basename(exe_file)}_{pid}_{timestamp}.json"
+    try:
+        with open(out_file, "w", encoding="utf-8") as fout:
+            subprocess.run(["syft", exe_file, "-o", "cyclonedx-json"],
+                           stdout=fout, stderr=subprocess.DEVNULL, check=True, timeout=60)
+        print(f"[+] Syft 정적 SBOM 생성됨 → {out_file}")
+    except Exception as e:
+        print(f"[!] syft 실행 실패: {e}")
+
+# --- [DTrace 이벤트 핸들러] ------------------------------------------------
+def process_dtrace_event(line: str):
+    # ... (기존 process_dtrace_event 함수 내용 유지) ...
+    global runtime_sbom, seen
+
+    if line.startswith("EXEC:"):
+        parts = line.strip().split(':', 2)
+        if len(parts) != 3:
+            return
+
+        try:
+            pid = int(parts[1])
+            exe_file = parts[2]
+            proc_name = os.path.basename(exe_file)
+
+            # 데몬 환경에서는 로그 파일에 기록
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [실행 감지] {proc_name} (PID={pid}) → {exe_file}")
+
+            # 1. 실행된 바이너리 자체 component
+            main_version = get_soname_unix(exe_file)
+            main_purl = f"pkg:generic/{proc_name}?pid={pid}&exe={exe_file}"
+            
+            if main_purl not in seen:
+                runtime_sbom["components"].append({
+                    "type": "application",
+                    "name": proc_name,
+                    "version": main_version,
+                    "purl": main_purl
+                })
+                seen.add(main_purl)
+
+            # 2. 로드된 라이브러리들도 추가
+            libs_info = get_loaded_libs(pid)
+            for lib_path, version in libs_info.items():
+                lib_name = os.path.basename(lib_path)
+                purl = f"pkg:generic/{lib_name}?file_path={lib_path}"
+                if purl not in seen:
+                    runtime_sbom["components"].append({
+                        "type": "library",
+                        "name": lib_name,
+                        "version": version,
+                        "purl": purl
+                    })
+                    seen.add(purl)
+
+            # 3. 런타임 SBOM 저장 및 Syft 실행
+            with open(RUNTIME_SBOM_FILE, "w", encoding="utf-8") as f:
+                json.dump(runtime_sbom, f, indent=2, ensure_ascii=False)
+            print(f"[✔] 런타임 SBOM 업데이트 ({len(runtime_sbom['components'])} components)")
+
+            run_syft(exe_file, pid)
+
+        except Exception as e:
+            # 에러 발생 시 로그 파일에 기록
+            print(f"[!] 이벤트 처리 오류: {e}", file=sys.stderr)
+            pass
+
+def monitor_dtrace():
+    """DTrace를 서브프로세스로 실행하고 실시간 출력을 읽음 (메인 루프)"""
+    
+    # DTrace 명령어 실행: sudo 권한이 필요합니다.
+    dtrace_cmd = ["sudo", "dtrace", "-q", "-n", DTRACE_PROBE_SCRIPT]
+    
+    # 데몬화 후에는 PID가 변경되므로, 로그에 현재 PID를 기록
+    print(f"🚀 DTrace 감시 시작 (PID: {os.getpid()})")
+    
+    try:
+        # Popen을 사용하여 DTrace 출력을 스트리밍으로 읽기
+        process = subprocess.Popen(dtrace_cmd, stdout=subprocess.PIPE, 
+                                   stderr=subprocess.STDOUT, text=True, bufsize=1)
+        
+        # 출력 라인별로 읽어 처리
+        for line in iter(process.stdout.readline, ''):
+            if process.poll() is not None:
+                break
+            process_dtrace_event(line)
+            
+    except FileNotFoundError:
+        print("\n❌ 오류: 'dtrace' 명령을 찾을 수 없습니다.")
+        sys.exit(1)
+    except Exception as e:
+        print(f"\n❌ 치명적인 오류: {e}", file=sys.stderr)
+    finally:
+        if 'process' in locals() and process.poll() is None:
+            process.terminate()
+        print(f"\n🛑 종료: 런타임 SBOM 저장 완료: {RUNTIME_SBOM_FILE}")
+
+if __name__ == "__main__":
+    if not sys.platform.startswith("darwin"):
+        print("❌ 이 스크립트는 macOS (Darwin) 전용 DTrace를 사용합니다. 실행을 중단합니다.")
+        sys.exit(1)
+        
+    # 데몬화 컨텍스트 생성
+    daemon_context = DaemonizeContext()
+    
+    # 실행 시 인수가 있으면 포그라운드로 실행 (디버깅용)
+    if len(sys.argv) > 1 and sys.argv[1].lower() == 'foreground':
+        print("💡 포그라운드 모드 실행 중 (Ctrl+C로 종료)")
+        monitor_dtrace() # monitor_dtrace는 자체적으로 터미널 출력을 사용함
+    else:
+        # 인수가 없으면 백그라운드로 데몬화 실행
+        print("💡 백그라운드 데몬으로 전환 중... 로그: /var/log/dtrace_sbom_monitor.log")
+        print("⚠️ DTrace 사용을 위해 스크립트를 반드시 sudo로 실행해야 합니다.")
+        
+        # 데몬화 실행 (monitor_dtrace 함수가 데몬 내부에서 호출됨)
+        daemonize(daemon_context)
+nedx-runtime-sbom.json"
+b = BPF(text=bpf_program_code)
+syscall_fnname = b.get_syscall_fnname("execve")
+b.attach_kprobe(event=syscall_fnname, fn_name="trace_execve")
+
+# (new_sbom, get_loaded_libs, run_syft, handle_event 함수는 내용 변경 없음)
+def new_sbom():
+    return {
+        "bomFormat": "CycloneDX",
+        "specVersion": "1.5",
+        "version": 1,
+        "metadata": {
+            "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "tools": [
+                {
+                    "vendor": "custom",
+                    "name": "runtime-monitor",
+                    "version": "1.0"
+                }
+            ],
+            "component": {
+                "type": "application",
+                "name": "runtime-monitor",
+                "version": "1.0"
+            },
+            "properties": [
+                {"name": "host.os", "value": platform.system()},
+                {"name": "host.os_version", "value": platform.version()},
+                {"name": "host.kernel", "value": platform.release()},
+                {"name": "host.arch", "value": platform.machine()}
+            ]
+        },
+        "components": []
+    }
+
+def get_loaded_libs(pid: int) -> dict:
+    # ... (기존 get_loaded_libs 함수 내용) ...
+    libs_info = {}
+    try:
+        proc = psutil.Process(pid)
+        for m in proc.memory_maps():
+            path = getattr(m, "path", None)
+            if not path or not os.path.isabs(path) or not os.path.isfile(path):
+                continue
+            if path in libs_info:
+                continue
+            libs_info[path] = "runtime"
+    except Exception:
+        pass
+    return libs_info
+
+def run_syft(exe_file: str, pid: int):
+    # ... (기존 run_syft 함수 내용) ...
+    if not which("syft"):
+        print("[!] syft 미설치: 정적 SBOM 생략")
+        return
+    timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    out_file = f"cyclonedx-static-sbom_{os.path.basename(exe_file)}_{pid}_{timestamp}.json"
+    try:
+        with open(out_file, "w", encoding="utf-8") as fout:
+            subprocess.run(["syft", exe_file, "-o", "cyclonedx-json"],
+                            stdout=fout, stderr=subprocess.DEVNULL, check=True, timeout=60)
+        print(f"[+] Syft 정적 SBOM 생성됨 → {out_file}")
+    except Exception as e:
+        print(f"[!] syft 실행 실패: {e}")
+
+
+# 메인 루프를 함수로 분리
+def main_loop():
+    global runtime_sbom, seen
+    print(f"🚀 런타임 SBOM 감시 시작 (PID: {os.getpid()})")
+
+    # 기존 파일 있으면 불러오기
+    if os.path.exists(RUNTIME_SBOM_FILE):
+        try:
+            with open(RUNTIME_SBOM_FILE, "r", encoding="utf-8") as f:
+                runtime_sbom = json.load(f)
+        except:
+            runtime_sbom = new_sbom()
+    else:
+        runtime_sbom = new_sbom()
+
+    seen = set(comp["purl"] for comp in runtime_sbom.get("components", []))
+
+    # 이벤트 처리
+    def handle_event(cpu, data, size):
+        nonlocal runtime_sbom, seen
+        event = b["events"].event(data)
+        proc_name = event.comm.decode("utf-8", "replace")
+        exe_file = event.filename.decode("utf-8", "replace")
+        pid = event.pid
+
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] [실행 감지] {proc_name} (PID={pid}) → {exe_file}")
+
+        # 실행된 바이너리 자체 component
+        main_purl = f"pkg:generic/{proc_name}?pid={pid}&exe={exe_file}"
+        if main_purl not in seen:
+            runtime_sbom["components"].append({
+                "type": "application",
+                "name": proc_name,
+                "version": "runtime",
+                "purl": main_purl
+            })
+            seen.add(main_purl)
+
+        # 로드된 라이브러리들도 추가
+        libs_info = get_loaded_libs(pid)
+        for lib_path, version in libs_info.items():
+            lib_name = os.path.basename(lib_path)
+            purl = f"pkg:generic/{lib_name}?file_path={lib_path}"
+            if purl not in seen:
+                runtime_sbom["components"].append({
+                    "type": "library",
+                    "name": lib_name,
+                    "version": version,
+                    "purl": purl
+                })
+                seen.add(purl)
+
+        # 런타임 SBOM 저장
+        try:
+            with open(RUNTIME_SBOM_FILE, "w", encoding="utf-8") as f:
+                json.dump(runtime_sbom, f, indent=2, ensure_ascii=False)
+            print(f" 런타임 SBOM 업데이트 ({len(runtime_sbom['components'])} components)")
+        except Exception as e:
+            print(f"[!] SBOM 저장 실패: {e}")
+
+        # syft 실행해서 정적 SBOM 별도 저장
+        run_syft(exe_file, pid)
+
+    # eBPF 버퍼 연결
+    b["events"].open_perf_buffer(handle_event)
+
+    # 무한 폴링 루프
+    try:
+        while True:
+            b.perf_buffer_poll()
+    except KeyboardInterrupt:
+        # 이 루프는 데몬화되면 잡히지 않음 (서비스 중지 필요)
+        print("\n🛑 데몬화된 프로세스에서 Ctrl+C는 무시.")
+    except Exception as e:
+        print(f"치명적 오류 발생: {e}")
+    finally:
+        print("🛑 종료: 런타임 SBOM 저장 완료:", RUNTIME_SBOM_FILE)
+
+
+if __name__ == "__main__":
+    # 데몬화 컨텍스트 생성
+    daemon_context = DaemonizeContext()
+    
+    # 스크립트 실행 시 인수가 있으면 포그라운드로 실행 (디버깅용)
+    if len(sys.argv) > 1 and sys.argv[1].lower() == 'foreground':
+        print("💡 포그라운드 모드 실행 중 (Ctrl+C로 종료)")
+        with daemon_context: # PID 관리만 함
+            main_loop()
+    else:
+        # 인수가 없으면 백그라운드로 데몬화 실행
+        print("💡 백그라운드 데몬으로 전환 중... 로그: /tmp/runtime_sbom_monitor.log")
+        daemonize(daemon_context)
