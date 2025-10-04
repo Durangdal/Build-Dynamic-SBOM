@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+import os
+import sys
+import json
+import time
+import psutil
+import subprocess
+from datetime import datetime
+from shutil import which
+
+# --- 설정 ---
+SBOM_DIR = os.path.join(os.getcwd(), "sbom_logs")
+os.makedirs(SBOM_DIR, exist_ok=True)
+
+LOG_FILE = os.path.join(SBOM_DIR, "sbom_monitor.log")
+RUNTIME_SBOM_FILE = os.path.join(SBOM_DIR, "runtime_sbom.json")
+
+# 감시 대상 실행 파일
+TARGET_EXECUTABLES = {
+    "python", "python.exe",
+    "node", "node.exe",
+    "java", "java.exe",
+    "nginx", "nginx.exe"
+}
+
+seen_pids = set()
+seen_components = set()
+
+# --- 유틸리티 ---
+def log(msg):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{timestamp}] {msg}"
+    print(line)
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+def create_cyclonedx_sbom(exe_name, pid, libs_info, runtime=True):
+    sbom = {
+        "bomFormat": "CycloneDX",
+        "specVersion": "1.5",
+        "version": 1,
+        "metadata": {
+            "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "component": {"type": "application", "name": exe_name, "version": "runtime" if runtime else "static"}
+        },
+        "components": []
+    }
+    for lib_path, version in libs_info.items():
+        lib_name = os.path.basename(lib_path)
+        cleaned_path = lib_path.replace(":", "").replace("\\", "/")
+        sbom["components"].append({
+            "type": "library",
+            "name": lib_name,
+            "version": version,
+            "purl": f"pkg:generic/{lib_name}?file_path={cleaned_path}"
+        })
+    return sbom
+
+def save_sbom(sbom, filename):
+    try:
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(sbom, f, indent=2, ensure_ascii=False)
+        log(f"SBOM 저장됨 → {filename} (components={len(sbom['components'])})")
+    except Exception as e:
+        log(f"SBOM 저장 실패: {e}")
+
+def get_loaded_libs(pid):
+    libs_info = {}
+    try:
+        proc = psutil.Process(pid)
+        for m in proc.memory_maps():
+            path = getattr(m, "path", None)
+            if not path or not os.path.isfile(path):
+                continue
+            if path in libs_info:
+                continue
+            libs_info[path] = "runtime"
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        pass
+    return libs_info
+
+def run_syft(exe_file, pid):
+    if not which("syft"):
+        log(f"syft 미설치: {exe_file} static SBOM 생략")
+        return
+    timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    out_file = os.path.join(SBOM_DIR, f"syft_{os.path.basename(exe_file)}_{pid}_{timestamp}.json")
+    try:
+        with open(out_file, "w", encoding="utf-8") as fout:
+            subprocess.run(["syft", exe_file, "-o", "cyclonedx-json"], stdout=fout, stderr=subprocess.DEVNULL, check=True, timeout=60)
+        log(f"Syft Static SBOM 생성됨 → {out_file}")
+    except Exception as e:
+        log(f"syft 실행 실패: {exe_file} ({e})")
+
+# --- 메인 루프 ---
+def main():
+    log("🏁 런타임 SBOM 감시 시작")
+    # 기존 런타임 SBOM 로드
+    if os.path.exists(RUNTIME_SBOM_FILE):
+        try:
+            with open(RUNTIME_SBOM_FILE, "r", encoding="utf-8") as f:
+                runtime_sbom = json.load(f)
+            for comp in runtime_sbom.get("components", []):
+                seen_components.add(comp["purl"])
+        except:
+            runtime_sbom = create_cyclonedx_sbom("runtime-monitor", os.getpid(), {})
+    else:
+        runtime_sbom = create_cyclonedx_sbom("runtime-monitor", os.getpid(), {})
+
+    while True:
+        for proc in psutil.process_iter(attrs=["pid", "name", "exe"]):
+            try:
+                pid = proc.info["pid"]
+                exe_name_raw = proc.info.get("name") or ""
+                exe_name = exe_name_raw.lower()
+                exe_file = proc.info.get("exe") or ""
+
+                if pid in seen_pids or exe_name not in TARGET_EXECUTABLES:
+                    continue
+
+                seen_pids.add(pid)
+                log(f"✅ 실행 감지: {exe_name_raw} (PID={pid}) → {exe_file}")
+
+                # Runtime SBOM 생성
+                libs_info = get_loaded_libs(pid)
+                sbom = create_cyclonedx_sbom(exe_name_raw, pid, libs_info, runtime=True)
+                # components 중복 방지
+                for comp in sbom["components"]:
+                    if comp["purl"] not in seen_components:
+                        runtime_sbom["components"].append(comp)
+                        seen_components.add(comp["purl"])
+                save_sbom(runtime_sbom, RUNTIME_SBOM_FILE)
+
+                # Static SBOM (Syft)
+                if exe_file:
+                    run_syft(exe_file, pid)
+
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+            except Exception as e:
+                log(f"예외 발생: {e}")
+        time.sleep(1)
+
+if __name__ == "__main__":
+    main()
